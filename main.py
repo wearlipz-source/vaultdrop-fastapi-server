@@ -91,7 +91,7 @@ def validate_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Shared yt-dlp options
+# Shared yt-dlp options (metadata-only, no download)
 # ---------------------------------------------------------------------------
 COMMON_YDL_OPTS = {
     "quiet": True,
@@ -166,6 +166,43 @@ def _ffmpeg_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Server-side CDN URL guard — ensures we never accidentally return a raw CDN URL
+# ---------------------------------------------------------------------------
+_CDN_PATTERNS = [
+    "googlevideo.com",
+    "storage.googleapis.com",
+    "youtube.com/videoplayback",
+    "tiktokcdn.com",
+    "fbcdn.net",
+    "cdninstagram.com",
+    "akamaized.net",
+    "cloudfront.net",
+    "twitch.tv/vod",
+    "redd.it",
+    "v.redd.it",
+]
+
+
+def _is_cdn_url(url: str) -> bool:
+    """Return True if the URL looks like a temporary CDN stream URL."""
+    lower = url.lower()
+    return any(p in lower for p in _CDN_PATTERNS)
+
+
+def _assert_railway_url(url: str, context: str = ""):
+    """Raise HTTPException if url is a CDN URL instead of a /merged/ Railway URL."""
+    if not url.startswith("/merged/"):
+        if _is_cdn_url(url):
+            logger.error(f"[GUARD] {context} CDN URL leaked: {url[:80]}")
+            raise HTTPException(
+                500,
+                "Server configuration error: backend returned a CDN URL instead of a "
+                "Railway-hosted /merged/ URL. Ensure the Railway deployment is running "
+                "VaultDrop v4.0+ with server-side download enabled.",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Temp file registry — track all temp dirs for cleanup on shutdown
 # ---------------------------------------------------------------------------
 _temp_dirs_lock = threading.Lock()
@@ -209,179 +246,110 @@ async def startup_event():
     logger.info(f"[STARTUP] VaultDrop v4.0.0 started. ffmpeg={_ffmpeg_available()}")
 
 
-def _merge_video_audio_server(
-    video_url: str,
-    audio_url: str,
+# ---------------------------------------------------------------------------
+# Server-side full download via yt-dlp (actual file download, not CDN URL)
+# ---------------------------------------------------------------------------
+def _download_and_merge_server(
+    url: str,
+    format_id: str,
     output_path: str,
-    timeout_seconds: int = 600,
-) -> tuple[bool, str]:
+    timeout_seconds: int = 1800,
+) -> tuple[bool, str, dict]:
     """
-    Use ffmpeg to merge separate video and audio streams into a single mp4.
-    Returns (success: bool, error_message: str).
-
-    Reliability guarantees:
-    - Verifies output file exists AND has non-zero size
-    - Kills zombie ffmpeg processes on timeout
-    - Returns detailed error on failure
+    Use yt-dlp to fully download video+audio and merge into a single mp4 on disk.
+    yt-dlp handles the ffmpeg merge internally when format_id contains '+'.
+    Returns (success: bool, error_message: str, info: dict).
     """
-    if not _ffmpeg_available():
-        return False, "ffmpeg not available on server"
-
-    proc = None
+    info_holder = {}
     try:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", video_url,
-            "-i", audio_url,
-            "-c:v", "copy",
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-movflags", "+faststart",
-            "-f", "mp4",
-            output_path,
-        ]
-        logger.info(f"[MERGE] Starting ffmpeg merge → {output_path}")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            # Kill zombie ffmpeg process
-            proc.kill()
-            proc.communicate()  # drain pipes
-            logger.error(f"[MERGE] ffmpeg timed out after {timeout_seconds}s — process killed")
-            return False, f"ffmpeg timed out after {timeout_seconds}s"
+        # outtmpl must NOT include the extension — yt-dlp appends it automatically.
+        # If we pass "merged_TOKEN.mp4", yt-dlp creates "merged_TOKEN.mp4.mp4".
+        # Strip any extension from output_path and let merge_output_format=mp4 handle it.
+        base_path = output_path
+        if base_path.endswith(".mp4"):
+            base_path = base_path[:-4]
 
-        if proc.returncode != 0:
-            err_tail = stderr.decode("utf-8", errors="replace")[-500:] if stderr else "unknown"
-            logger.error(f"[MERGE] ffmpeg failed (rc={proc.returncode}): {err_tail}")
-            return False, f"ffmpeg exit code {proc.returncode}"
+        ydl_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+            "skip_download": False,          # MUST be False — actually download the file
+            "simulate": False,               # Explicitly disable simulate mode
+            "format": format_id,
+            "outtmpl": base_path + ".%(ext)s",  # yt-dlp fills in the correct extension
+            "merge_output_format": "mp4",
+            "postprocessors": [{
+                "key": "FFmpegVideoConvertor",
+                "preferedformat": "mp4",
+            }],
+            "socket_timeout": 60,
+            "http_headers": {
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                )
+            },
+        }
 
-        # Verify output file exists and has content
-        if not os.path.exists(output_path):
-            logger.error("[MERGE] ffmpeg succeeded but output file missing")
-            return False, "output file not created"
+        logger.info(f"[SERVER-DL] Starting yt-dlp download: format={format_id} → {base_path}.mp4")
 
-        size = os.path.getsize(output_path)
-        if size == 0:
-            logger.error("[MERGE] ffmpeg succeeded but output file is empty")
-            os.remove(output_path)
-            return False, "output file is empty"
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if info:
+                info_holder.update(info)
 
-        logger.info(f"[MERGE] ffmpeg merge successful: {output_path} ({size:,} bytes)")
-        return True, ""
+        # yt-dlp saves the merged file as base_path + ".mp4" (due to merge_output_format=mp4)
+        # but search the temp dir for any completed file in case the name differs.
+        parent = os.path.dirname(base_path)
+        stem = os.path.basename(base_path)
 
-    except FileNotFoundError:
-        return False, "ffmpeg binary not found"
-    except Exception as e:
-        logger.error(f"[MERGE] Unexpected ffmpeg error: {e}")
-        if proc and proc.poll() is None:
+        # Priority 1: expected merged mp4
+        expected_mp4 = base_path + ".mp4"
+        if os.path.exists(expected_mp4) and os.path.getsize(expected_mp4) > 0:
+            actual_path = expected_mp4
+        else:
+            # Priority 2: scan temp dir for any non-partial file matching our stem
+            candidates = []
             try:
-                proc.kill()
-                proc.communicate()
-            except Exception:
-                pass
-        return False, str(e)
+                for f in os.listdir(parent):
+                    full = os.path.join(parent, f)
+                    if (
+                        os.path.isfile(full)
+                        and not f.endswith(".part")
+                        and not f.endswith(".ytdl")
+                        and not f.endswith(".tmp")
+                        and os.path.getsize(full) > 0
+                    ):
+                        candidates.append(full)
+            except Exception as scan_err:
+                logger.warning(f"[SERVER-DL] Dir scan error: {scan_err}")
 
+            if not candidates:
+                return False, "Downloaded file not found on disk after yt-dlp completed", info_holder
 
-def _extract_best_url(info: dict, formats: list) -> tuple[str | None, str, int | None, str | None, str | None]:
-    """
-    Extract the best direct downloadable URL from yt-dlp info.
-    Returns (url, ext, filesize, quality_label, audio_url).
-    audio_url is non-None when video and audio are separate streams.
-    """
-    ext = info.get("ext", "mp4")
-    filesize = None
-    quality_label = None
-    download_url = None
-    audio_url = None
+            # Pick the largest file (most likely the merged video)
+            actual_path = max(candidates, key=os.path.getsize)
 
-    # 1. requested_formats — yt-dlp selected specific formats
-    requested_formats = info.get("requested_formats")
-    if requested_formats:
-        # Try progressive (video+audio in one stream)
-        for rf in requested_formats:
-            if (rf.get("url")
-                    and rf.get("vcodec") not in (None, "none")
-                    and rf.get("acodec") not in (None, "none")):
-                download_url = rf["url"]
-                ext = rf.get("ext", "mp4")
-                filesize = rf.get("filesize") or rf.get("filesize_approx")
-                quality_label = rf.get("format_note") or (
-                    f"{rf['height']}p" if rf.get("height") else None
-                )
-                logger.info("[DOWNLOAD] Using progressive requested_format (video+audio)")
-                break
+        size = os.path.getsize(actual_path)
+        if size == 0:
+            return False, "Downloaded file is empty (0 bytes)", info_holder
 
-        # Separate video + audio streams
-        if not download_url:
-            video_rf = next(
-                (rf for rf in requested_formats
-                 if rf.get("url") and rf.get("vcodec") not in (None, "none")),
-                None
-            )
-            audio_rf = next(
-                (rf for rf in requested_formats
-                 if rf.get("url") and rf.get("acodec") not in (None, "none")
-                 and rf.get("vcodec") in (None, "none")),
-                None
-            )
+        logger.info(f"[SERVER-DL] Download complete: {actual_path} ({size:,} bytes)")
 
-            if video_rf:
-                download_url = video_rf["url"]
-                ext = video_rf.get("ext", "mp4")
-                filesize = (video_rf.get("filesize") or video_rf.get("filesize_approx") or 0)
-                quality_label = video_rf.get("format_note") or (
-                    f"{video_rf['height']}p" if video_rf.get("height") else None
-                )
-                if audio_rf:
-                    audio_url = audio_rf["url"]
-                    audio_filesize = audio_rf.get("filesize") or audio_rf.get("filesize_approx") or 0
-                    filesize = (filesize or 0) + audio_filesize
-                    logger.info("[DOWNLOAD] Separate video+audio streams detected")
-                else:
-                    logger.warning("[DOWNLOAD] Video-only stream, no audio found")
-            else:
-                for rf in requested_formats:
-                    if rf.get("url"):
-                        download_url = rf["url"]
-                        ext = rf.get("ext", "mp4")
-                        filesize = rf.get("filesize")
-                        break
+        # Normalise to the expected output_path (always .mp4)
+        if actual_path != output_path:
+            shutil.move(actual_path, output_path)
+            logger.info(f"[SERVER-DL] Moved {actual_path} → {output_path}")
 
-    # 2. Top-level info["url"]
-    if not download_url and info.get("url"):
-        download_url = info["url"]
-        ext = info.get("ext", "mp4")
-        filesize = info.get("filesize") or info.get("filesize_approx")
-        logger.info("[DOWNLOAD] Using info['url']")
+        return True, "", info_holder
 
-    # 3. Search formats list
-    if not download_url:
-        for f in reversed(formats):
-            if (f.get("url")
-                    and f.get("vcodec") not in (None, "none")
-                    and f.get("acodec") not in (None, "none")):
-                download_url = f["url"]
-                ext = f.get("ext", "mp4")
-                filesize = f.get("filesize") or f.get("filesize_approx")
-                quality_label = f.get("format_note") or (
-                    f"{f['height']}p" if f.get("height") else None
-                )
-                break
-
-        if not download_url:
-            for f in reversed(formats):
-                if f.get("url"):
-                    download_url = f["url"]
-                    ext = f.get("ext", "mp4")
-                    filesize = f.get("filesize") or f.get("filesize_approx")
-                    break
-
-    return download_url, ext or "mp4", int(filesize) if filesize else None, quality_label, audio_url
+    except yt_dlp.utils.DownloadError as e:
+        logger.error(f"[SERVER-DL] yt-dlp DownloadError: {e}")
+        return False, str(e), info_holder
+    except Exception as e:
+        logger.error(f"[SERVER-DL] Unexpected error: {e}")
+        return False, str(e), info_holder
 
 
 # ---------------------------------------------------------------------------
@@ -444,7 +412,7 @@ class DownloadResponse(BaseModel):
     uploader: str | None = None
     qualityLabel: str | None = None
     audioUrl: str | None = None
-    merged: bool = False
+    merged: bool = True
 
 
 class ResolveRequest(BaseModel):
@@ -610,7 +578,6 @@ async def analyze_video(req: AnalyzeRequest, request: Request):
             if audio_formats:
                 best_audio = max(audio_formats, key=lambda f: f.get("abr") or 0)
                 filesize = best_audio.get("filesize") or best_audio.get("filesize_approx")
-                # Prefer mp3 > m4a > opus > webm for audio-only
                 audio_ext = best_audio.get("ext", "m4a")
                 if audio_ext not in ("mp3", "m4a", "aac", "opus"):
                     audio_ext = "m4a"
@@ -667,14 +634,9 @@ def _run_ydl_extract(url: str, opts: dict) -> dict:
 @limiter.limit("10/minute")
 async def download_video(req: DownloadRequest, request: Request):
     """
-    Resolve a direct download URL for a specific format_id.
-
-    Strategy:
-    1. If video+audio are in one stream → return direct URL (client downloads via Dio)
-    2. If separate streams AND ffmpeg available → merge server-side into temp mp4,
-       serve merged file via /merged/<token> endpoint
-    3. If separate streams AND ffmpeg unavailable OR merge fails →
-       return video URL only (audio missing) — client falls back gracefully
+    Fully download and merge video+audio on the Railway server using yt-dlp + ffmpeg.
+    Saves the merged mp4 locally and returns ONLY a Railway-hosted /merged/{token} URL.
+    Flutter NEVER receives YouTube CDN URLs directly.
     """
     url = validate_url(req.url)
     format_id = req.format_id.strip()
@@ -683,99 +645,100 @@ async def download_video(req: DownloadRequest, request: Request):
     if not format_id:
         raise HTTPException(400, "format_id must not be empty")
 
-    ydl_opts = {
-        **COMMON_YDL_OPTS,
-        "format": format_id,
-    }
-
+    # First extract metadata (no download) to get title/thumbnail/duration
+    meta_opts = {**COMMON_YDL_OPTS, "format": format_id}
     async with _YDL_SEMAPHORE:
         try:
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: _run_ydl_extract(url, ydl_opts))
 
-            if info.get("_type") == "playlist":
-                entries = info.get("entries", [])
-                if not entries:
-                    raise HTTPException(422, "Playlist is empty")
-                info = entries[0]
+            # Step 1: Extract metadata
+            logger.info(f"[DOWNLOAD] Extracting metadata for: {url}")
+            try:
+                info = await loop.run_in_executor(None, lambda: _run_ydl_extract(url, meta_opts))
+                if info.get("_type") == "playlist":
+                    entries = info.get("entries", [])
+                    info = entries[0] if entries else {}
+            except Exception as meta_err:
+                logger.warning(f"[DOWNLOAD] Metadata extraction failed (non-fatal): {meta_err}")
+                info = {}
 
-            formats = info.get("formats", [])
-            logger.info(f"[DOWNLOAD] Title={info.get('title')!r} formats={len(formats)}")
+            title = info.get("title") or "video"
+            thumbnail = _best_thumbnail(info)
+            duration = int(info["duration"]) if info.get("duration") else None
+            uploader = info.get("uploader") or info.get("channel")
 
-            download_url, ext, filesize, quality_label, audio_url = _extract_best_url(info, formats)
+            # Step 2: Full server-side download + merge
+            tmp_dir = tempfile.mkdtemp(prefix="vaultdrop_")
+            _register_temp_dir(tmp_dir)
+            merged_token = uuid.uuid4().hex
+            output_path = os.path.join(tmp_dir, f"merged_{merged_token}.mp4")
 
-            if not download_url:
-                logger.error(f"[DOWNLOAD] No URL found for format_id={format_id}")
-                raise HTTPException(422, "Could not extract a direct download URL for this video")
+            logger.info(f"[DOWNLOAD] Starting server-side download → {output_path}")
 
-            # Guard: reject webpage URLs
-            if any(x in download_url for x in ["youtube.com/watch", "youtu.be/", "tiktok.com/@"]):
-                logger.error(f"[DOWNLOAD] Webpage URL returned: {download_url[:80]}")
-                raise HTTPException(422, "Server returned a webpage URL instead of a stream URL. Try a different quality.")
+            ok, err, dl_info = await loop.run_in_executor(
+                None,
+                lambda: _download_and_merge_server(url, format_id, output_path)
+            )
 
-            # --- Server-side ffmpeg merge if separate streams ---
-            merged = False
-            if audio_url and _ffmpeg_available():
-                logger.info("[DOWNLOAD] Attempting server-side ffmpeg merge...")
-                tmp_dir = tempfile.mkdtemp(prefix="vaultdrop_")
-                _register_temp_dir(tmp_dir)
-                merged_path = os.path.join(tmp_dir, f"merged_{uuid.uuid4().hex}.mp4")
+            if not ok:
+                _cleanup_temp_dir(tmp_dir)
+                logger.error(f"[DOWNLOAD] Server-side download failed: {err}")
+                # Map yt-dlp errors to friendly messages
+                err_lower = err.lower()
+                if "private" in err_lower:
+                    raise HTTPException(422, "This video is private and cannot be downloaded.")
+                if "age" in err_lower:
+                    raise HTTPException(422, "Age-restricted video — cannot be downloaded without login.")
+                if "not available" in err_lower or "unavailable" in err_lower:
+                    raise HTTPException(422, "This video is not available in your region.")
+                if "removed" in err_lower or "deleted" in err_lower:
+                    raise HTTPException(422, "This video has been removed.")
+                if "login" in err_lower or "sign in" in err_lower:
+                    raise HTTPException(422, "This video requires login to download.")
+                if "copyright" in err_lower:
+                    raise HTTPException(422, "This video is blocked due to copyright.")
+                if "live" in err_lower or "is live" in err_lower:
+                    raise HTTPException(422, "Live streams cannot be downloaded.")
+                if "geo" in err_lower or "blocked" in err_lower:
+                    raise HTTPException(422, "This content is geo-blocked in the server region.")
+                raise HTTPException(500, f"Server-side download failed: {err[:300]}")
 
-                try:
-                    merge_ok, merge_err = await loop.run_in_executor(
-                        None,
-                        lambda: _merge_video_audio_server(download_url, audio_url, merged_path)
-                    )
+            # Use info from download if metadata extraction failed earlier
+            if dl_info and not title or title == "video":
+                title = dl_info.get("title") or title
+            if dl_info and not thumbnail:
+                thumbnail = _best_thumbnail(dl_info)
+            if dl_info and not duration:
+                duration = int(dl_info["duration"]) if dl_info.get("duration") else None
+            if dl_info and not uploader:
+                uploader = dl_info.get("uploader") or dl_info.get("channel")
 
-                    if merge_ok:
-                        # Store merged file for serving, schedule cleanup after 10 min
-                        merged_token = uuid.uuid4().hex
-                        _merged_files[merged_token] = {
-                            "path": merged_path,
-                            "tmp_dir": tmp_dir,
-                            "created": time.time(),
-                            "ext": "mp4",
-                        }
-                        # Schedule cleanup after 10 minutes
-                        asyncio.create_task(_schedule_merged_cleanup(merged_token, delay=600))
+            file_size = os.path.getsize(output_path)
 
-                        merged_url = f"/merged/{merged_token}"
-                        logger.info(f"[DOWNLOAD] Merge successful, token={merged_token}")
-                        merged = True
+            # Store merged file for serving, schedule cleanup after 30 minutes
+            _merged_files[merged_token] = {
+                "path": output_path,
+                "tmp_dir": tmp_dir,
+                "created": time.time(),
+                "ext": "mp4",
+            }
+            asyncio.create_task(_schedule_merged_cleanup(merged_token, delay=1800))
 
-                        return DownloadResponse(
-                            downloadUrl=merged_url,
-                            title=info.get("title") or "video",
-                            ext="mp4",
-                            filesize=os.path.getsize(merged_path),
-                            thumbnail=_best_thumbnail(info),
-                            duration=int(info["duration"]) if info.get("duration") else None,
-                            uploader=info.get("uploader") or info.get("channel"),
-                            qualityLabel=quality_label,
-                            audioUrl=None,  # already merged
-                            merged=True,
-                        )
-                    else:
-                        logger.warning(f"[DOWNLOAD] ffmpeg merge failed: {merge_err} — falling back to video-only URL")
-                        _cleanup_temp_dir(tmp_dir)
-
-                except Exception as e:
-                    logger.error(f"[DOWNLOAD] Merge exception: {e}")
-                    _cleanup_temp_dir(tmp_dir)
-
-            logger.info(f"[DOWNLOAD] OK ext={ext} filesize={filesize} merged={merged} url={download_url[:80]}...")
+            merged_url = f"/merged/{merged_token}"
+            _assert_railway_url(merged_url, context="[DOWNLOAD]")
+            logger.info(f"[DOWNLOAD] Ready: token={merged_token} size={file_size:,} bytes")
 
             return DownloadResponse(
-                downloadUrl=download_url,
-                title=info.get("title") or "video",
-                ext=ext or "mp4",
-                filesize=filesize,
-                thumbnail=_best_thumbnail(info),
-                duration=int(info["duration"]) if info.get("duration") else None,
-                uploader=info.get("uploader") or info.get("channel"),
-                qualityLabel=quality_label,
-                audioUrl=audio_url,
-                merged=merged,
+                downloadUrl=merged_url,
+                title=title,
+                ext="mp4",
+                filesize=file_size,
+                thumbnail=thumbnail,
+                duration=duration,
+                uploader=uploader,
+                qualityLabel=None,
+                audioUrl=None,
+                merged=True,
             )
 
         except HTTPException:
@@ -808,7 +771,7 @@ from fastapi.responses import FileResponse as _FileResponse
 
 @app.get("/merged/{token}")
 async def serve_merged_file(token: str):
-    """Serve a server-merged mp4 file by token (ephemeral — expires after 10 min)."""
+    """Serve a server-merged mp4 file by token (ephemeral — expires after 30 min)."""
     entry = _merged_files.get(token)
     if not entry:
         raise HTTPException(404, "Merged file not found or expired. Please re-download.")
@@ -821,12 +784,12 @@ async def serve_merged_file(token: str):
     return _FileResponse(
         path=path,
         media_type="video/mp4",
-        filename=f"vaultdrop_merged_{token[:8]}.mp4",
+        filename=f"vaultdrop_{token[:8]}.mp4",
     )
 
 
 # ---------------------------------------------------------------------------
-# Legacy /resolve endpoint — backward compatibility
+# Legacy /resolve endpoint — now also uses server-side download
 # ---------------------------------------------------------------------------
 def quality_to_format(quality: str) -> str:
     q = quality.lower().strip()
@@ -849,43 +812,78 @@ def quality_to_format(quality: str) -> str:
 @app.post("/resolve")
 @limiter.limit("20/minute")
 async def resolve_video(req: ResolveRequest, request: Request):
+    """
+    Legacy endpoint — now performs full server-side download like /download.
+    Returns /merged/{token} URL, never raw CDN URLs.
+    """
     url = validate_url(req.url)
     fmt = quality_to_format(req.quality)
-    logger.info(f"[RESOLVE] url={url} quality={req.quality}")
-    ydl_opts = {**COMMON_YDL_OPTS, "format": fmt}
+    logger.info(f"[RESOLVE] url={url} quality={req.quality} format={fmt}")
 
     async with _YDL_SEMAPHORE:
         try:
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: _run_ydl_extract(url, ydl_opts))
 
-            if info.get("_type") == "playlist":
-                entries = info.get("entries", [])
-                if not entries:
-                    raise HTTPException(422, "Playlist is empty")
-                info = entries[0]
+            # Extract metadata first
+            meta_opts = {**COMMON_YDL_OPTS, "format": fmt}
+            try:
+                info = await loop.run_in_executor(None, lambda: _run_ydl_extract(url, meta_opts))
+                if info.get("_type") == "playlist":
+                    entries = info.get("entries", [])
+                    info = entries[0] if entries else {}
+            except Exception:
+                info = {}
 
-            formats = info.get("formats", [])
-            download_url, ext, filesize, quality_label, audio_url = _extract_best_url(info, formats)
+            title = info.get("title") or "video"
+            thumbnail = _best_thumbnail(info)
+            duration = int(info["duration"]) if info.get("duration") else None
+            uploader = info.get("uploader") or info.get("channel")
 
-            if not download_url:
-                raise HTTPException(422, "Could not extract a direct download URL for this video")
+            # Full server-side download
+            tmp_dir = tempfile.mkdtemp(prefix="vaultdrop_")
+            _register_temp_dir(tmp_dir)
+            merged_token = uuid.uuid4().hex
+            output_path = os.path.join(tmp_dir, f"merged_{merged_token}.mp4")
 
-            logger.info(f"[RESOLVE] OK url={download_url[:80]}...")
+            ok, err, dl_info = await loop.run_in_executor(
+                None,
+                lambda: _download_and_merge_server(url, fmt, output_path)
+            )
 
-            thumbnails = info.get("thumbnails", [])
-            thumbnail = thumbnails[-1].get("url") if thumbnails else info.get("thumbnail")
+            if not ok:
+                _cleanup_temp_dir(tmp_dir)
+                raise HTTPException(500, f"Server-side download failed: {err[:300]}")
+
+            if dl_info and (not title or title == "video"):
+                title = dl_info.get("title") or title
+            if dl_info and not thumbnail:
+                thumbnail = _best_thumbnail(dl_info)
+
+            file_size = os.path.getsize(output_path)
+
+            _merged_files[merged_token] = {
+                "path": output_path,
+                "tmp_dir": tmp_dir,
+                "created": time.time(),
+                "ext": "mp4",
+            }
+            asyncio.create_task(_schedule_merged_cleanup(merged_token, delay=1800))
+
+            merged_url = f"/merged/{merged_token}"
+            _assert_railway_url(merged_url, context="[RESOLVE]")
+            logger.info(f"[RESOLVE] Ready: token={merged_token} size={file_size:,} bytes")
 
             return {
-                "downloadUrl": download_url,
-                "title": info.get("title") or "video",
-                "ext": ext or "mp4",
-                "filesize": filesize,
+                "downloadUrl": merged_url,
+                "title": title,
+                "ext": "mp4",
+                "filesize": file_size,
                 "thumbnail": thumbnail,
-                "duration": int(info["duration"]) if info.get("duration") else None,
-                "uploader": info.get("uploader") or info.get("channel"),
-                "qualityLabel": quality_label,
-                "audioUrl": audio_url,
+                "duration": duration,
+                "uploader": uploader,
+                "qualityLabel": req.quality,
+                "audioUrl": None,
+                "merged": True,
             }
 
         except HTTPException:
