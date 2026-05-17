@@ -100,6 +100,7 @@ COMMON_YDL_OPTS = {
     "skip_download": True,
     "socket_timeout": 30,
     "extractor_args": {"facebook": {"api":"graphql"}},
+    "force_generic_extractor":False,
     "http_headers": {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
