@@ -269,6 +269,35 @@ def _download_and_merge_server(
         if base_path.endswith(".mp4"):
             base_path = base_path[:-4]
 
+        # Detect platform for platform-specific options
+        is_facebook = any(d in url.lower() for d in ["facebook.com", "fb.watch", "fb.com"])
+        is_instagram = "instagram.com" in url.lower()
+        is_twitter = any(d in url.lower() for d in ["twitter.com", "x.com"])
+
+        # Build platform-specific HTTP headers
+        http_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+        }
+
+        if is_facebook:
+            http_headers["Referer"] = "https://www.facebook.com/"
+            http_headers["Sec-Fetch-Dest"] = "document"
+            http_headers["Sec-Fetch-Mode"] = "navigate"
+            http_headers["Sec-Fetch-Site"] = "none"
+        elif is_instagram:
+            http_headers["Referer"] = "https://www.instagram.com/"
+        elif is_twitter:
+            http_headers["Referer"] = "https://twitter.com/"
+
         ydl_opts = {
             "quiet": True,
             "no_warnings": True,
@@ -283,14 +312,16 @@ def _download_and_merge_server(
                 "preferedformat": "mp4",
             }],
             "socket_timeout": 60,
-            "http_headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
-                )
-            },
+            "http_headers": http_headers,
         }
+
+        # Facebook-specific extractor args to improve download reliability
+        if is_facebook:
+            ydl_opts["extractor_args"] = {
+                "facebook": {
+                    "webpage_url_basename": ["video"],
+                }
+            }
 
         logger.info(f"[SERVER-DL] Starting yt-dlp download: format={format_id} → {base_path}.mp4")
 
