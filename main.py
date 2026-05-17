@@ -106,6 +106,13 @@ COMMON_YDL_OPTS = {
             "Chrome/124.0.0.0 Safari/537.36"
         )
     },
+    # Force working YouTube player clients that don't require PO tokens
+    "extractor_args": {
+        "youtube": {
+            "player_client": ["tv,ios,android_vr,web_embedded"],
+            "player_skip": ["webpage"],
+        }
+    },
 }
 
 
@@ -270,6 +277,7 @@ def _download_and_merge_server(
             base_path = base_path[:-4]
 
         # Detect platform for platform-specific options
+        is_youtube = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
         is_facebook = any(d in url.lower() for d in ["facebook.com", "fb.watch", "fb.com"])
         is_instagram = "instagram.com" in url.lower()
         is_twitter = any(d in url.lower() for d in ["twitter.com", "x.com"])
@@ -315,8 +323,19 @@ def _download_and_merge_server(
             "http_headers": http_headers,
         }
 
+        # YouTube-specific: force working player clients that bypass bot detection / PO token requirement
+        if is_youtube:
+            ydl_opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["tv,ios,android_vr,web_embedded"],
+                    "player_skip": ["webpage"],
+                }
+            }
+            ydl_opts["sleep_interval_requests"] = 1
+            ydl_opts["sleep_interval"] = 2
+
         # Facebook-specific extractor args to improve download reliability
-        if is_facebook:
+        elif is_facebook:
             ydl_opts["extractor_args"] = {
                 "facebook": {
                     "webpage_url_basename": ["video"],
